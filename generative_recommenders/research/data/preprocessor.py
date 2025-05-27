@@ -28,6 +28,8 @@ import numpy as np
 
 import pandas as pd
 
+from scipy.optimize import curve_fit
+
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
@@ -430,11 +432,203 @@ class AmazonDataProcessor(DataProcessor):
         return num_unique_items
 
 
+class KuaiDataProcessor(DataProcessor):
+    def __init__(
+        self,
+        download_path: str,
+        saved_name: str,
+        prefix: str,
+        convert_timestamp: bool,
+        expected_num_unique_items: Optional[int] = None,
+        expected_max_item_id: Optional[int] = None,
+    ) -> None:
+        super().__init__(prefix, expected_num_unique_items, expected_max_item_id)
+        self._download_path = download_path
+        self._saved_name = saved_name
+        self._convert_timestamp: bool = convert_timestamp
+
+    def download(self) -> None:
+        if not self.file_exists(self._saved_name):
+            import subprocess
+            subprocess.run(["wget", self._download_path, "--no-check-certificate", "-O", self._saved_name], check=True)
+        if self._saved_name[-4:] == ".zip":
+            ZipFile(self._saved_name, "r").extractall(path="tmp/")
+            import shutil
+            shutil.move(src="tmp/KuaiRec 2.0/data", dst=f"tmp/{self._prefix}")
+        else:
+            print(f"{self._saved_name} is not a zip file")
+
+    def processed_item_csv(self) -> str:
+        return f"tmp/processed/{self._prefix}/videos.csv"
+
+    def sasrec_format_csv_by_user_train(self) -> str:
+        return f"tmp/{self._prefix}/sasrec_format_by_user_train_Kuai.csv"
+
+    def sasrec_format_csv_by_user_test(self) -> str:
+        return f"tmp/{self._prefix}/sasrec_format_by_user_test_Kuai.csv"
+
+    def normalize_video_rating(self, ratings: pd.DataFrame) -> pd.DataFrame:
+        
+        initial_clip = 1
+
+        def exp_func(x: np.ndarray, a: float, b: float) -> np.ndarray:
+            """exp-decay model  y = a + (c - a) exp(-b · x)."""
+            return a + (initial_clip - a) * np.exp(-b * x)
+        
+        ratings["watch_ratio"] = ratings["watch_ratio"].clip(0, initial_clip)
+        ratings["duration_bin"] = pd.qcut(ratings["video_duration"], q=20, duplicates="drop")
+        bin_means = (
+            ratings.groupby("duration_bin", observed=True)
+            .agg(avg_duration=("video_duration", "mean"),
+                avg_watch_ratio=("watch_ratio", "mean"))
+            .sort_values("avg_duration")
+            .reset_index(drop=True)
+        )
+        popt, _ = curve_fit(
+            exp_func,
+            bin_means["avg_duration"],
+            bin_means["avg_watch_ratio"],
+            p0=(1.0, 5e-4),
+        )
+        a_hat, b_hat = popt
+
+        expected_watch_ratio = exp_func(ratings['video_duration'], a_hat, b_hat)
+        ratings['expected_watch_ratio'] = expected_watch_ratio
+        ratings['ratings'] = ratings['watch_ratio'] / expected_watch_ratio
+        ratings['ratings'] = np.clip(ratings['ratings'], 0, 1)
+        
+        return ratings
+
+    def preprocess_rating(self) -> int:
+        self.download()
+
+        if self._prefix == "kuai_video":
+            users = pd.read_csv(
+                f"tmp/{self._prefix}/user_features.csv",
+                usecols=["user_id", "onehot_feat0", "onehot_feat1", "onehot_feat2", "onehot_feat3"],
+            )
+            ratings = pd.read_csv(
+                f"tmp/{self._prefix}/small_matrix.csv",
+                usecols=["user_id", "video_id", "video_duration", "timestamp", "watch_ratio"]
+            )
+            videos = None
+
+
+        if users is not None:
+            ## Users
+            users.onehot_feat0 = pd.Categorical(users.onehot_feat0)
+            users["onehot_feat0"] = users.onehot_feat0.cat.codes
+
+            users.onehot_feat1 = pd.Categorical(users.onehot_feat1)
+            users["onehot_feat1"] = users.onehot_feat1.cat.codes
+
+            users.onehot_feat2 = pd.Categorical(users.onehot_feat2)
+            users["onehot_feat2"] = users.onehot_feat2.cat.codes
+
+            users.onehot_feat3 = pd.Categorical(users.onehot_feat3)
+            users["onehot_feat3"] = users.onehot_feat3.cat.codes
+            
+
+        ratings = ratings.dropna()
+        ratings["timestamp"] = ratings["timestamp"].astype(int)
+        ratings = self.normalize_video_rating(ratings)
+        # Normalize movie ids to speed up training
+        print(
+            f"{self._prefix} #item before normalize: {len(set(ratings['video_id'].values))}"
+        )
+        print(
+            f"{self._prefix} max item id before normalize: {max(set(ratings['video_id'].values))}"
+        )
+        # Normalize video IDs to continuous range [0, num_unique_items-1]
+        ratings["video_id"] = pd.Categorical(ratings["video_id"])
+        ratings["video_id"] = ratings.video_id.cat.codes
+
+        print(f"{self._prefix} #item after normalize: {len(set(ratings['video_id'].values))}")
+        print(f"{self._prefix} max item id after normalize: {max(set(ratings['video_id'].values))}")
+
+        if self._convert_timestamp:
+            ratings["timestamp"] = pd.to_datetime(
+                ratings["timestamp"], unit="s"
+            )
+
+        # Save primary csv's
+        if not os.path.exists(f"tmp/processed/{self._prefix}"):
+            os.makedirs(f"tmp/processed/{self._prefix}")
+        if users is not None:
+            users.to_csv(f"tmp/processed/{self._prefix}/users.csv", index=False)
+        if videos is not None:
+            videos.to_csv(f"tmp/processed/{self._prefix}/videos.csv", index=False)
+
+        ratings.to_csv(f"tmp/processed/{self._prefix}/ratings.csv", index=False)
+
+        num_unique_users = len(set(ratings["user_id"].values))
+        num_unique_items = len(set(ratings["video_id"].values))
+
+        # SASRec version
+        ratings_group = ratings.sort_values(by=["timestamp"]).groupby("user_id")
+        seq_ratings_data = pd.DataFrame(
+            data={
+                "user_id": list(ratings_group.groups.keys()),
+                "item_ids": list(ratings_group.video_id.apply(list)),
+                "ratings": list(ratings_group.ratings.apply(list)),
+                "timestamps": list(ratings_group.timestamp.apply(list)),
+            }
+        )
+
+        seq_ratings_data["user_id"] = pd.Categorical(seq_ratings_data["user_id"])
+        seq_ratings_data["user_id"] = seq_ratings_data.user_id.cat.codes
+        
+        result = pd.DataFrame([[]])
+        for col in ["item_ids"]:
+            result[col + "_len_mean"] = seq_ratings_data[col].apply(len).mean()
+            result[col + "_len_min"] = seq_ratings_data[col].apply(len).min()
+            result[col + "_len_max"] = seq_ratings_data[col].apply(len).max()
+        print(self._prefix)
+        print(result)
+
+        seq_ratings_data = self.to_seq_data(seq_ratings_data, users)
+        # print(seq_ratings_data.head())
+        seq_ratings_data.sample(frac=1).reset_index().to_csv(
+            self.output_format_csv(), index=False, sep=","
+        )
+        
+        # Split by user ids (not tested yet)
+        user_id_split = int(num_unique_users * 0.9)
+        seq_ratings_data_train = seq_ratings_data[
+            seq_ratings_data["user_id"] <= user_id_split
+        ]
+        seq_ratings_data_train.sample(frac=1).reset_index().to_csv(
+            self.sasrec_format_csv_by_user_train(),
+            index=False,
+            sep=",",
+        )
+        seq_ratings_data_test = seq_ratings_data[
+            seq_ratings_data["user_id"] > user_id_split
+        ]
+        seq_ratings_data_test.sample(frac=1).reset_index().to_csv(
+            self.sasrec_format_csv_by_user_test(), index=False, sep=","
+        )
+        print(
+            f"{self._prefix}: train num user: {len(set(seq_ratings_data_train['user_id'].values))}"
+        )
+        print(
+            f"{self._prefix}: test num user: {len(set(seq_ratings_data_test['user_id'].values))}"
+        )
+
+        # print(seq_ratings_data)
+        if self.expected_num_unique_items() is not None:
+            assert (
+                self.expected_num_unique_items() == num_unique_items
+            ), f"Expected items: {self.expected_num_unique_items()}, got: {num_unique_items}"
+
+        return num_unique_items
+
+
 def get_common_preprocessors() -> (
     Dict[
         str,
         Union[
-            AmazonDataProcessor, MovielensDataProcessor, MovielensSyntheticDataProcessor
+            AmazonDataProcessor, MovielensDataProcessor, MovielensSyntheticDataProcessor, KuaiDataProcessor
         ],
     ]
 ):
@@ -471,10 +665,18 @@ def get_common_preprocessors() -> (
         prefix="amzn_books",
         expected_num_unique_items=695762,
     )
+    kuai_video_dp = KuaiDataProcessor(  # pyre-ignore [45]
+        "https://kuairec.com/",
+        "tmp/KuaiRec.zip",
+        prefix="kuai_video",
+        convert_timestamp=False,
+        expected_num_unique_items=3327,
+    )
     return {
         "ml-1m": ml_1m_dp,
         "ml-20m": ml_20m_dp,
         "ml-1b": ml_1b_dp,
         "ml-3b": ml_3b_dp,
         "amzn-books": amzn_books_dp,
+        "kuai_video": kuai_video_dp,
     }
